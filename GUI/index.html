@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#111827" />
+
+    <title>Geofence UI — NDIA Hackathon</title>
+    <meta name="description" content="Tablet-friendly GUI to draw and send geofence polygons." />
+
+    <!-- Leaflet core (map renderer) -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <!-- Leaflet.draw (polygon drawing/edit controls) -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"
+    />
+
+    <!-- App styles -->
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app" class="app">
+      <!-- Top App Bar -->
+      <header class="appbar" role="banner">
+        <div class="appbar__left">
+          <span class="brand">Geofence UI</span>
+          <span class="badge" id="appVersion" aria-label="app version">v0.1</span>
+        </div>
+        <nav class="toolbar" aria-label="Primary actions">
+          <!-- Buttons are wired by app.js later -->
+          <button id="btnDraw" class="btn" type="button" title="Start drawing polygon">Draw</button>
+          <button id="btnEdit" class="btn" type="button" title="Edit polygon" disabled>Edit</button>
+          <button id="btnClear" class="btn btn-ghost" type="button" title="Clear polygon" disabled>Clear</button>
+          <button id="btnRecenter" class="btn btn-ghost" type="button" title="Recenter map">Recenter</button>
+        </nav>
+      </header>
+
+      <!-- Map Canvas -->
+      <main id="map" class="map" role="application" aria-label="Interactive map">
+        <!-- Leaflet will render here -->
+      </main>
+
+      <!-- Bottom Sheet (details & send) -->
+      <section id="infoSheet" class="sheet" aria-live="polite" aria-label="Geofence details">
+        <div class="sheet__handle" aria-hidden="true"></div>
+        <div class="sheet__content">
+          <div class="sheet__row">
+            <label for="fenceName" class="label">Fence name</label>
+            <input id="fenceName" class="input" type="text" placeholder="e.g., Test Area Alpha" inputmode="text" />
+          </div>
+
+          <div id="statsArea" class="stats">
+            <div class="stat"><span>Vertices</span><strong id="statVertices">0</strong></div>
+            <div class="stat"><span>Perimeter</span><strong id="statPerimeter">—</strong></div>
+            <div class="stat"><span>Area</span><strong id="statArea">—</strong></div>
+          </div>
+
+          <div class="sheet__row">
+            <label class="label" for="jsonPreview">Payload preview (read-only)</label>
+            <textarea id="jsonPreview" class="codearea" spellcheck="false" readonly
+              placeholder='Will show GeoJSON-style payload after you draw…'></textarea>
+          </div>
+
+          <div class="sheet__actions">
+            <button id="btnSend" class="btn btn-primary" type="button" disabled>Send to Server</button>
+            <button id="btnRetryQueue" class="btn btn-ghost" type="button" hidden>Retry queued</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Toasts / status (screen-reader friendly) -->
+      <div id="statusToast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+    </div>
+
+    <!-- Scripts (logic comes later in app.js) -->
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin="">
+    </script>
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,270 @@
+/*
+  Geofence UI — base styles
+  - Mobile/tablet-first
+  - Full-viewport map
+  - Accessible, big touch targets
+  - Light/dark aware via prefers-color-scheme
+*/
+
+:root {
+  --bg:           #0b1220;
+  --panel:        #111827;
+  --panel-2:      #0f172a;
+  --text:         #e5e7eb;
+  --muted:        #9ca3af;
+  --border:       #1f2937;
+  --brand:        #60a5fa; /* soft blue */
+  --success:      #34d399;
+  --error:        #f87171;
+
+  --radius: 16px;
+  --shadow: 0 10px 30px rgba(0,0,0,0.35);
+  --blur:   saturate(180%) blur(6px);
+
+  --btn-h: 44px; /* minimum touch target height */
+  --pad:   12px;
+  --gap:   10px;
+  --font:  ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:      #f7fafc;
+    --panel:   #ffffff;
+    --panel-2: #f9fafb;
+    --text:    #111827;
+    --muted:   #6b7280;
+    --border:  #e5e7eb;
+    --brand:   #2563eb;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; }
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+/* App Bar / Toolbar */
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  padding: 8px 12px;
+  background: color-mix(in oklab, var(--panel), transparent 10%);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: var(--blur);
+}
+
+.appbar__left {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.toolbar {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.btn {
+  height: var(--btn-h);
+  padding: 0 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.05s ease, background 0.2s ease, border-color 0.2s ease, opacity 0.2s ease;
+  user-select: none;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--brand);
+  border-color: color-mix(in oklab, var(--brand), black 15%);
+  color: white;
+}
+
+.btn-ghost {
+  background: transparent;
+}
+
+/* Map takes full available space beneath the appbar */
+.map {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: calc(100dvh - 64px); /* safe-ish; appbar ~64px tall */
+}
+
+/* Ensure Leaflet's container fills the map area */
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+  outline: none;
+  background: var(--panel-2);
+}
+
+/* Bottom Sheet */
+.sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 1001;
+  max-width: 100vw;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  border-top-left-radius: var(--radius);
+  border-top-right-radius: var(--radius);
+  box-shadow: var(--shadow);
+  transform: translateY(calc(100% - 56px)); /* collapsed to header */
+  transition: transform 220ms ease;
+}
+.sheet.open { transform: translateY(0%); }
+
+.sheet__handle {
+  width: 44px; height: 5px; border-radius: 999px;
+  background: var(--border);
+  margin: 10px auto 4px;
+}
+
+.sheet__content {
+  padding: 8px 12px 12px 12px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr;
+}
+
+.sheet__row {
+  display: grid;
+  gap: 8px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.stat {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+}
+.stat span { color: var(--muted); font-size: 12px; }
+.stat strong { font-variant-numeric: tabular-nums; }
+
+.sheet__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+
+.label {
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.input {
+  height: var(--btn-h);
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  outline: none;
+}
+.input::placeholder { color: color-mix(in oklab, var(--muted), transparent 10%); }
+.input:focus { border-color: color-mix(in oklab, var(--brand), white 10%); }
+
+.codearea {
+  width: 100%;
+  min-height: 120px;
+  max-height: 220px;
+  resize: vertical;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12.5px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Toast / status */
+.toast {
+  position: fixed;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1100;
+  min-width: 220px;
+  max-width: min(90vw, 560px);
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--panel), transparent 5%);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, -4px);
+}
+.toast.success { border-color: color-mix(in oklab, var(--success), black 20%); }
+.toast.error   { border-color: color-mix(in oklab, var(--error), black 20%); }
+
+/* Utility */
+.is-hidden { display: none !important; }
+.is-disabled { pointer-events: none; opacity: 0.6; }
+
+/* Larger touch targets on bigger screens */
+@media (min-width: 768px) {
+  .toolbar .btn { padding: 0 16px; }
+  .sheet__content { padding: 12px 16px 16px 16px; }
+  .codearea { min-height: 140px; max-height: 300px; }
+}
