@@ -1,20 +1,19 @@
-// app.js — Geofence UI (Custom Draw + Stable Geolocate)
-// - Custom "draw mode" with square vertex handles & midpoint insert during initial draw
-// - Auto-center only once on first GPS fix (no recenter during drawing)
-// - Live stats + JSON preview while drawing, and after finishing
-// - Same send/queue logic as before
+// app.js — Geofence UI (Startup GPS + Auto GPS + Queue Manager)
+// - Centers on current GPS at startup
+// - "Update GPS" button re-acquires and recenters
+// - "Auto GPS" toggle uses watchPosition (pauses during draw/edit)
+// - Queue panel: list, Load for editing (handles), Save, Send, Remove
 
 (() => {
   // ====== A) Config ======
-  const APP_VERSION = "0.3.0";
-  const API_URL = "http://172.31.23.188:5001/api/geofence"; // ← set your Python endpoint, e.g. "https://example.com/geofences"
+  const APP_VERSION = "0.4.0";
+  const API_URL = "http://54.152.250.137:5001/api/geofence"; // ← set your Python endpoint, e.g. "https://example.com/geofences"
   const ENABLE_OFFLINE_QUEUE = true;
 
-  const MAP_DEFAULT_CENTER = [38.8895, -77.0352]; // DC Mall fallback
+  const MAP_DEFAULT_CENTER = [38.8895, -77.0352]; // only used if GPS fails
   const MAP_DEFAULT_ZOOM = 13;
   const MAX_VERTICES = 200;
 
-  // Handle sizes for custom modes
   const VERT_SIZE = 14;   // px (square vertex)
   const MID_SIZE  = 10;   // px (round midpoint)
 
@@ -22,39 +21,42 @@
   const state = {
     leafletMap: null,
     drawnItems: null,       // FeatureGroup for final polygon
-    drawnLayer: null,       // Final polygon layer (once "finished")
+    drawnLayer: null,       // Final polygon layer
     mode: "idle",           // idle | drawing | editing | ready | sending | success | error
 
-    // Geolocation behavior
+    // Geolocation
     currentPosition: null,  // {lat, lon, accuracy}
-    didInitialCenter: false,
-    userMovedMap: false,
+    locCircle: null,        // accuracy circle
+    gpsWatchId: null,       // watchPosition id
+    userMovedMap: false,    // prevent unwanted auto recenters while user pans
 
     // Payload + queue
     fenceName: "",
     geojson: null,
     queue: [],
+    loadedQueueId: null,    // id of queue item currently loaded for edit
     online: navigator.onLine,
 
     // Custom edit/draw UI
-    editLayerGroup: null,   // LayerGroup to hold vertex/midpoint markers
+    editLayerGroup: null,
     vertexMarkers: [],
     midMarkers: [],
 
     // Custom draw mode
     drawRing: [],           // Array<LatLng> while drawing
-    drawTempPolygon: null,  // L.Polygon preview while drawing
+    drawTempPolygon: null,
   };
 
   const dom = {
     appVersion:    document.getElementById("appVersion"),
     map:           document.getElementById("map"),
+
     btnDraw:       document.getElementById("btnDraw"),
     btnEdit:       document.getElementById("btnEdit"),
     btnClear:      document.getElementById("btnClear"),
-    btnRecenter:   document.getElementById("btnRecenter"),
+    btnRecenter:   document.getElementById("btnRecenter"), // will be retitled to "Update GPS"
     btnSend:       document.getElementById("btnSend"),
-    btnRetryQueue: document.getElementById("btnRetryQueue"),
+    btnQueue:      document.getElementById("btnRetryQueue"), // repurposed as "Queue"
     fenceName:     document.getElementById("fenceName"),
     infoSheet:     document.getElementById("infoSheet"),
     jsonPreview:   document.getElementById("jsonPreview"),
@@ -68,16 +70,28 @@
   window.addEventListener("DOMContentLoaded", init);
 
   function init() {
-    dom.appVersion && (dom.appVersion.textContent = `v${APP_VERSION}`);
+    if (dom.appVersion) dom.appVersion.textContent = `v${APP_VERSION}`;
+
+    // Rename buttons for clarity
+    dom.btnRecenter.textContent = "Update GPS";
+    dom.btnQueue.textContent = "Queue";
+
+    // Inject Auto GPS toggle into the toolbar
+    injectAutoGpsToggle();
+
     bindUI();
     loadQueue();
+
     initMap();
-    tryGeolocate(); // will auto-center only once if user hasn't moved the map
+
+    // Immediately try to geolocate and center on startup
+    acquireAndCenterGPS(true);
 
     renderButtons();
     renderSheet(false);
     renderStats();
     renderJsonPreview();
+    refreshQueueBadge();
 
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
@@ -96,61 +110,104 @@
 
     map.setView(MAP_DEFAULT_CENTER, MAP_DEFAULT_ZOOM);
 
-    // Track user interaction so auto-center won't kick in later
+    // If the user starts panning/zooming, don't auto-yank later
     map.on("movestart", () => { state.userMovedMap = true; });
 
     // Feature group for the final polygon
-    const drawnItems = new L.FeatureGroup();
-    state.drawnItems = drawnItems;
-    map.addLayer(drawnItems);
+    state.drawnItems = new L.FeatureGroup();
+    map.addLayer(state.drawnItems);
   }
 
-  // ====== E) Geolocation (stable behavior) ======
-  function tryGeolocate() {
+  // ====== E) Geolocation ======
+  function acquireAndCenterGPS(showToastOnFail = false) {
     if (!("geolocation" in navigator)) {
-      toast("Geolocation unsupported; using default view.", "error");
+      if (showToastOnFail) toast("Geolocation unsupported; using default view.", "error");
       return;
     }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         const { latitude, longitude, accuracy } = pos.coords;
         state.currentPosition = { lat: latitude, lon: longitude, accuracy };
-
-        // Auto-center ONLY ONCE and ONLY if user hasn't moved the map yet
-        if (!state.didInitialCenter && !state.userMovedMap) {
-          state.leafletMap.setView([latitude, longitude], 16);
-          L.circle([latitude, longitude], {
-            radius: Math.min(accuracy || 0, 60),
-            weight: 1, opacity: 0.6, fillOpacity: 0.08,
-          }).addTo(state.leafletMap);
-          state.didInitialCenter = true;
-        }
+        centerMapOnCurrentPos(true);
       },
       (err) => {
         console.warn("Geolocation error:", err);
-        toast("Couldn’t get GPS; using default view.", "error");
+        if (showToastOnFail) toast("Couldn’t get GPS; using default view.", "error");
       },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 20000 }
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
     );
   }
 
-  function recenter() {
-    if (state.currentPosition) {
-      state.leafletMap.setView([state.currentPosition.lat, state.currentPosition.lon], 16);
+  function centerMapOnCurrentPos(force = false) {
+    if (!state.currentPosition) return;
+    // Do not recenter while drawing/editing unless forced (explicit Update GPS)
+    if (!force && (state.mode === "drawing" || state.mode === "editing")) return;
+
+    const { lat, lon, accuracy } = state.currentPosition;
+    state.leafletMap.setView([lat, lon], Math.max(state.leafletMap.getZoom(), 16));
+
+    // Draw/update accuracy circle
+    if (!state.locCircle) {
+      state.locCircle = L.circle([lat, lon], {
+        radius: Math.min(accuracy || 0, 60),
+        weight: 1, opacity: 0.6, fillOpacity: 0.08,
+      }).addTo(state.leafletMap);
     } else {
-      tryGeolocate();
+      state.locCircle.setLatLng([lat, lon]);
+      state.locCircle.setRadius(Math.min(accuracy || 0, 60));
     }
   }
 
-  // ====== F) Custom DRAW MODE (shows boxes while placing points) ======
-  function startCustomDraw() {
-    // Prevent later auto-center from yanking the view mid-draw
-    state.userMovedMap = true;
+  function updateGPS() {
+    // Explicit re-acquire + recenter (even during draw/edit)
+    acquireAndCenterGPS(true);
+  }
 
-    // If a polygon exists, clear it for a fresh draw
+  function startAutoGPS() {
+    if (!("geolocation" in navigator)) {
+      toast("Auto GPS not supported on this device.", "error");
+      return;
+    }
+    if (state.gpsWatchId !== null) navigator.geolocation.clearWatch(state.gpsWatchId);
+
+    state.gpsWatchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        state.currentPosition = {
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          accuracy: pos.coords.accuracy
+        };
+        // Auto center only if not drawing/editing and user hasn't panned
+        if (!state.userMovedMap && state.mode !== "drawing" && state.mode !== "editing") {
+          centerMapOnCurrentPos(false);
+        } else {
+          // Still update the accuracy circle silently
+          centerMapOnCurrentPos(false);
+        }
+      },
+      (err) => {
+        console.warn("watchPosition error:", err);
+        toast("Auto GPS error.", "error");
+      },
+      { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 }
+    );
+    toast("Auto GPS on.", "success");
+  }
+
+  function stopAutoGPS() {
+    if (state.gpsWatchId !== null) {
+      navigator.geolocation.clearWatch(state.gpsWatchId);
+      state.gpsWatchId = null;
+      toast("Auto GPS off.", "success");
+    }
+  }
+
+  // ====== F) Custom DRAW MODE (shows handles while placing) ======
+  function startCustomDraw() {
+    state.userMovedMap = true; // don't auto yank while drawing
+
     if (state.drawnLayer) clearPolygon();
 
-    // Build layers for handles + preview polygon
     cleanupEditLayer();
     state.editLayerGroup = L.layerGroup().addTo(state.leafletMap);
     state.vertexMarkers = [];
@@ -158,23 +215,20 @@
     state.drawRing = [];
 
     if (state.drawTempPolygon) {
-      state.drawTempPolygon.remove();
-      state.drawTempPolygon = null;
+      state.drawTempPolygon.remove(); state.drawTempPolygon = null;
     }
     state.drawTempPolygon = L.polygon([], {
       color: "#3b82f6", weight: 2, fillOpacity: 0.08,
     }).addTo(state.leafletMap);
 
-    // Map interactions for drawing
     state.leafletMap.on("click", onMapClickAddVertex);
-    state.leafletMap.on("dblclick", finishCustomDraw); // quick finish via double click/tap
-    // Avoid Leaflet's default zoom on double click while drawing
+    state.leafletMap.on("dblclick", finishCustomDraw);
     state.leafletMap.doubleClickZoom.disable();
 
     state.mode = "drawing";
     renderButtons();
     renderSheet(true);
-    toast("Tap to add vertices. Double-tap or press Finish to complete.", "success", 3500);
+    toast("Tap to add vertices. Double-tap or press Finish.", "success", 3200);
   }
 
   function onMapClickAddVertex(e) {
@@ -186,10 +240,7 @@
   }
 
   function refreshDrawPreviewAndMids() {
-    // Update preview polygon
     state.drawTempPolygon.setLatLngs([state.drawRing]);
-
-    // Rebuild midpoints between each consecutive pair
     state.midMarkers.forEach(({ marker }) => marker.remove());
     state.midMarkers = [];
     for (let i = 0; i < state.drawRing.length; i++) {
@@ -200,34 +251,37 @@
 
   function finishCustomDraw() {
     if (state.mode !== "drawing") return;
-    if (state.drawRing.length < 3) {
-      toast("Need at least 3 vertices to finish.", "error");
-      return;
-    }
+    if (state.drawRing.length < 3) return toast("Need at least 3 vertices.", "error");
 
-    // Detach drawing events
+    // Stop draw listeners
     state.leafletMap.off("click", onMapClickAddVertex);
     state.leafletMap.off("dblclick", finishCustomDraw);
     state.leafletMap.doubleClickZoom.enable();
 
-    // Remove temp preview polygon; create final polygon layer
-    if (state.drawTempPolygon) {
-      state.drawTempPolygon.remove();
-      state.drawTempPolygon = null;
-    }
+    if (state.drawTempPolygon) { state.drawTempPolygon.remove(); state.drawTempPolygon = null; }
 
-    const finalPoly = L.polygon(state.drawRing, {
-      color: "#3b82f6", weight: 2, fillOpacity: 0.08,
-    });
+    const finalPoly = L.polygon(state.drawRing, { color: "#3b82f6", weight: 2, fillOpacity: 0.08 });
     state.drawnItems.addLayer(finalPoly);
     state.drawnLayer = finalPoly;
 
-    // Switch into our custom EDIT mode so handles stay visible & usable
     enterCustomEditMode(/*fromDraw=*/true);
     buildAndRenderPayload();
   }
 
-  // ====== G) Custom EDIT MODE (same feel for draw & edit) ======
+  function cancelCustomDraw() {
+    state.leafletMap.off("click", onMapClickAddVertex);
+    state.leafletMap.off("dblclick", finishCustomDraw);
+    state.leafletMap.doubleClickZoom.enable();
+    if (state.drawTempPolygon) { state.drawTempPolygon.remove(); state.drawTempPolygon = null; }
+    state.drawRing = [];
+    cleanupEditLayer();
+    state.mode = "idle";
+    renderButtons();
+    renderStats();
+    renderJsonPreview();
+  }
+
+  // ====== G) Custom EDIT MODE ======
   function enterCustomEditMode(fromDraw = false) {
     if (!state.drawnLayer) return;
 
@@ -242,27 +296,21 @@
 
     state.mode = "editing";
     renderButtons();
-    if (!fromDraw) {
-      toast("Drag squares to move. Tap a square to remove. Tap a dot to insert.", "success", 3400);
-    }
+    if (!fromDraw) toast("Drag squares to move. Tap a square to remove. Tap a dot to insert.", "success", 3200);
   }
 
   function exitCustomEditMode(save = true) {
     if (save && state.drawnLayer) {
       buildAndRenderPayload();
-      state.mode = "ready";
-    } else {
-      state.mode = state.drawnLayer ? "ready" : "idle";
+      // If we’re editing a loaded queue item, keep UI hint visible in queue panel
     }
+    state.mode = state.drawnLayer ? "ready" : "idle";
     cleanupEditLayer();
     renderButtons();
   }
 
   function cleanupEditLayer() {
-    if (state.editLayerGroup) {
-      state.editLayerGroup.remove();
-      state.editLayerGroup = null;
-    }
+    if (state.editLayerGroup) { state.editLayerGroup.remove(); state.editLayerGroup = null; }
     state.vertexMarkers = [];
     state.midMarkers = [];
   }
@@ -310,8 +358,7 @@
     });
 
     marker.on("click", () => {
-      if (dragged) return; // ignore click after drag
-      // Remove vertex (guard ≥3)
+      if (dragged) return;
       if (state.mode === "drawing" && forDraw) {
         if (state.drawRing.length <= 3) return toast("Need ≥ 3 vertices.", "error");
         state.drawRing.splice(index, 1);
@@ -343,7 +390,7 @@
           width:${MID_SIZE}px;height:${MID_SIZE}px;
           background:#fff;border:2px solid #9aa3af;border-radius:999px;
           box-shadow:0 1px 2px rgba(0,0,0,.2);
-        " title="Add vertex here"></div>`,
+        " title="Add vertex"></div>`,
       }),
       zIndexOffset: 900,
     });
@@ -374,8 +421,7 @@
     }
   }
 
-  function refreshAdjacentMidMarkers(index) {
-    // Simpler + safe: rebuild all mid markers
+  function refreshAdjacentMidMarkers() {
     state.midMarkers.forEach(({ marker }) => marker.remove());
     state.midMarkers = [];
     addAllMidMarkers(/*forDraw=*/false);
@@ -383,8 +429,6 @@
 
   function rebuildHandlesForCurrentMode() {
     if (!state.editLayerGroup) return;
-
-    // Clear all handle markers
     state.vertexMarkers.forEach((m) => m.remove());
     state.midMarkers.forEach(({ marker }) => marker.remove());
     state.vertexMarkers = [];
@@ -393,7 +437,6 @@
     if (state.mode === "drawing") {
       state.drawRing.forEach((ll, i) => addVertexMarker(ll, i, /*forDraw=*/true));
       addAllMidMarkers(/*forDraw=*/true);
-      // Update preview polygon geometry too
       if (state.drawTempPolygon) state.drawTempPolygon.setLatLngs([state.drawRing]);
     } else if (state.drawnLayer) {
       const ring = getRingLatLngs(state.drawnLayer);
@@ -407,7 +450,7 @@
     if (!layer) return [];
     const rings = layer.getLatLngs();
     const firstRing = Array.isArray(rings[0]) ? rings[0] : rings;
-    return firstRing.map((p) => L.latLng(p.lat, p.lng)); // OPEN ring (Leaflet closes visually)
+    return firstRing.map((p) => L.latLng(p.lat, p.lng));
   }
 
   function setRingLatLngs(layer, ring) {
@@ -464,11 +507,11 @@
     return Math.abs(sum) / 2;
   }
 
-  function buildPayloadFromLL(ringLL, name) {
+  function buildPayloadFromLL(ringLL, name, baseFenceId = null) {
     const ring = toClosedRingLonLat(ringLL);
     return {
       spec_version: "1.0",
-      fence_id: `ui-${uuidv4()}`,
+      fence_id: baseFenceId || `ui-${uuidv4()}`,
       created_at: new Date().toISOString(),
       crs: "EPSG:4326",
       shape: { type: "Polygon", coordinates: [ring] },
@@ -493,7 +536,9 @@
       renderJsonPreview(val.reason);
       return;
     }
-    state.geojson = buildPayloadFromLL(ringLL, state.fenceName);
+    // If editing a queue item, preserve its fence_id
+    const baseId = getLoadedQueueFenceId();
+    state.geojson = buildPayloadFromLL(ringLL, state.fenceName, baseId);
     dom.btnSend.disabled = false;
     renderStats(ringLL);
     renderJsonPreview();
@@ -521,14 +566,22 @@
         throw new Error(`Server ${res.status}: ${txt || res.statusText}`);
       }
       toast("Geofence sent successfully.", "success");
+
+      // If this was a loaded queue item, remove it from queue
+      if (state.loadedQueueId) {
+        removeQueuedItemById(state.loadedQueueId);
+        state.loadedQueueId = null;
+      }
+
       state.mode = "success";
       renderButtons();
+      refreshQueueBadge();
     } catch (err) {
       console.error(err);
       if (ENABLE_OFFLINE_QUEUE) {
         enqueue(state.geojson, String(err.message || err));
         toast("Send failed. Saved to queue.", "error");
-        dom.btnRetryQueue.hidden = false;
+        refreshQueueBadge();
       } else {
         toast("Send failed.", "error");
         state.mode = "error";
@@ -548,42 +601,39 @@
     saveQueue();
   }
 
-  async function retryQueue() {
-    if (!state.queue.length) {
-      toast("No queued items.", "success");
-      dom.btnRetryQueue.hidden = true;
-      return;
-    }
-    if (!API_URL) {
-      toast("Set API_URL first.", "error");
-      return;
-    }
-    setBusy(true);
-    const pending = [];
-    for (const item of state.queue) {
-      try {
-        const r = await fetch(API_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(item.payload),
-        });
-        if (!r.ok) throw new Error(`Server ${r.status}`);
-      } catch (e) {
-        item.attempts += 1;
-        item.last_error = String(e.message || e);
-        pending.push(item);
-      }
-    }
-    state.queue = pending;
-    saveQueue();
-    setBusy(false);
+  async function sendOneQueueItem(id) {
+    const idx = state.queue.findIndex((x) => x.id === id);
+    if (idx === -1) return;
+    const item = state.queue[idx];
+    if (!API_URL) return toast("Set API_URL first.", "error");
 
-    if (pending.length) {
-      toast(`Some items still queued (${pending.length}).`, "error");
-      dom.btnRetryQueue.hidden = false;
-    } else {
-      toast("All queued items sent.", "success");
-      dom.btnRetryQueue.hidden = true;
+    try {
+      const r = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(item.payload),
+      });
+      if (!r.ok) throw new Error(`Server ${r.status}`);
+      // success -> remove
+      state.queue.splice(idx, 1);
+      saveQueue();
+      toast("Queued item sent.", "success");
+      refreshQueuePanel(); refreshQueueBadge();
+    } catch (e) {
+      item.attempts += 1;
+      item.last_error = String(e.message || e);
+      saveQueue();
+      toast("Send failed for that item.", "error");
+      refreshQueuePanel(); refreshQueueBadge();
+    }
+  }
+
+  function removeQueuedItemById(id) {
+    const i = state.queue.findIndex((x) => x.id === id);
+    if (i >= 0) {
+      state.queue.splice(i, 1);
+      saveQueue();
+      refreshQueuePanel(); refreshQueueBadge();
     }
   }
 
@@ -594,11 +644,200 @@
     try {
       const raw = localStorage.getItem("geofenceQueue");
       if (raw) state.queue = JSON.parse(raw) || [];
-      dom.btnRetryQueue.hidden = !state.queue.length;
     } catch (_) { state.queue = []; }
   }
 
-  // ====== J) UI Wiring ======
+  // ====== J) Queue Panel (view/edit/remove/load) ======
+  function openQueuePanel() {
+    ensureQueuePanel();
+    dom.queuePanel.classList.remove("is-hidden");
+    refreshQueuePanel();
+    // Open the sheet if closed
+    dom.infoSheet.classList.add("open");
+  }
+
+  function closeQueuePanel() {
+    if (dom.queuePanel) dom.queuePanel.classList.add("is-hidden");
+  }
+
+  function refreshQueuePanel() {
+    ensureQueuePanel();
+    const list = dom.queueList;
+    list.innerHTML = "";
+
+    if (!state.queue.length) {
+      list.innerHTML = `<div style="padding:8px;color:var(--muted);">Queue is empty.</div>`;
+      return;
+    }
+
+    for (const item of state.queue) {
+      const li = document.createElement("div");
+      li.style.border = "1px solid var(--border)";
+      li.style.borderRadius = "6px";
+      li.style.padding = "8px";
+      li.style.marginBottom = "8px";
+      li.style.background = "var(--panel-2)";
+
+      const name = item.payload?.properties?.name || "(unnamed)";
+      const idShort = item.id.slice(0, 8);
+      const pts = (item.payload?.shape?.coordinates?.[0]?.length || 1) - 1;
+
+      li.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div style="display:grid;gap:2px;">
+            <strong style="font-size:14px;">${escapeHTML(name)}</strong>
+            <span style="font-size:12px;color:var(--muted);">ID ${idShort} • ${pts} pts • ${new Date(item.enqueued_at).toLocaleString()}</span>
+            ${item.last_error ? `<span style="font-size:12px;color:var(--error);">Last error: ${escapeHTML(item.last_error)}</span>` : ""}
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost" data-act="load" data-id="${item.id}">Load</button>
+            <button class="btn btn-ghost" data-act="send" data-id="${item.id}">Send</button>
+            <button class="btn" style="border-color:var(--error);color:var(--error);" data-act="remove" data-id="${item.id}">X</button>
+          </div>
+        </div>
+      `;
+      list.appendChild(li);
+    }
+  }
+
+  function ensureQueuePanel() {
+    if (dom.queuePanel) return;
+
+    const content = dom.infoSheet.querySelector(".sheet__content");
+    const panel = document.createElement("div");
+    panel.id = "queuePanel";
+    panel.className = "sheet__row is-hidden";
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <h3 style="margin:0;font-size:16px;">Queue</h3>
+        <div style="display:flex;gap:6px;">
+          <button id="btnQueueRetryAll" class="btn btn-ghost" type="button">Retry all</button>
+          <button id="btnQueueClose" class="btn" type="button">Close</button>
+        </div>
+      </div>
+      <div id="queueList" style="margin-top:8px;"></div>
+      <div id="queueSaveBar" class="is-hidden" style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;border-top:1px dashed var(--border);padding-top:8px;">
+        <button id="btnQueueSaveChanges" class="btn btn-primary" type="button">Save changes to item</button>
+      </div>
+    `;
+    content.appendChild(panel);
+
+    dom.queuePanel = panel;
+    dom.queueList = panel.querySelector("#queueList");
+    dom.queueSaveBar = panel.querySelector("#queueSaveBar");
+    dom.btnQueueRetryAll = panel.querySelector("#btnQueueRetryAll");
+    dom.btnQueueClose = panel.querySelector("#btnQueueClose");
+    dom.btnQueueSaveChanges = panel.querySelector("#btnQueueSaveChanges");
+
+    // Delegated click handlers for list items
+    dom.queueList.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      const id = btn.getAttribute("data-id");
+      const act = btn.getAttribute("data-act");
+      if (act === "load") loadQueueItemToMap(id);
+      else if (act === "send") sendOneQueueItem(id);
+      else if (act === "remove") removeQueuedItemById(id);
+    });
+
+    dom.btnQueueRetryAll.addEventListener("click", retryAllQueued);
+    dom.btnQueueClose.addEventListener("click", closeQueuePanel);
+    dom.btnQueueSaveChanges.addEventListener("click", saveEditsBackToQueue);
+  }
+
+  function retryAllQueued() {
+    if (!API_URL) return toast("Set API_URL first.", "error");
+    if (!state.queue.length) return toast("Queue is empty.", "success");
+    (async () => {
+      for (const item of [...state.queue]) {
+        await sendOneQueueItem(item.id);
+      }
+    })();
+  }
+
+  function loadQueueItemToMap(id) {
+    const item = state.queue.find((x) => x.id === id);
+    if (!item) return;
+
+    // Build layer from payload and enter edit mode
+    const ring = payloadToLatLngRing(item.payload);
+    if (!ring.length) return toast("Invalid geometry in item.", "error");
+
+    // Clear current polygon / draw state
+    if (state.mode === "drawing") cancelCustomDraw();
+    cleanupEditLayer();
+    if (state.drawnLayer) {
+      state.drawnItems.removeLayer(state.drawnLayer);
+      state.drawnLayer = null;
+    }
+
+    const poly = L.polygon(ring, { color: "#3b82f6", weight: 2, fillOpacity: 0.08 });
+    state.drawnItems.addLayer(poly);
+    state.drawnLayer = poly;
+
+    // Set name field
+    state.fenceName.value = item.payload?.properties?.name || "";
+    state.fenceName.dispatchEvent(new Event("input"));
+
+    // Track which queue item is loaded
+    state.loadedQueueId = id;
+
+    enterCustomEditMode(false);
+    buildAndRenderPayload();
+
+    // Show Save bar in panel
+    dom.queueSaveBar.classList.remove("is-hidden");
+    dom.infoSheet.classList.add("open");
+    toast("Loaded from queue. Edit via handles, then Save changes.", "success", 3200);
+  }
+
+  function saveEditsBackToQueue() {
+    if (!state.loadedQueueId || !state.drawnLayer) {
+      return toast("No loaded queue item.", "error");
+    }
+    const idx = state.queue.findIndex((x) => x.id === state.loadedQueueId);
+    if (idx === -1) return toast("Queue item missing.", "error");
+
+    const ringLL = getRingLatLngs(state.drawnLayer);
+    const baseId = getLoadedQueueFenceId();
+    const updated = buildPayloadFromLL(ringLL, state.fenceName.value || "", baseId);
+    state.queue[idx].payload = updated;
+    saveQueue();
+    refreshQueuePanel();
+    toast("Changes saved to queue item.", "success");
+  }
+
+  function payloadToLatLngRing(payload) {
+    try {
+      const ring = payload?.shape?.coordinates?.[0] || [];
+      // Exclude closing duplicate if present
+      const open = [];
+      for (let i = 0; i < ring.length; i++) {
+        const [lon, lat] = ring[i];
+        if (i < ring.length - 1 || (lon !== ring[0][0] || lat !== ring[0][1])) {
+          open.push(L.latLng(lat, lon));
+        }
+      }
+      return open;
+    } catch {
+      return [];
+    }
+  }
+
+  function getLoadedQueueFenceId() {
+    if (!state.loadedQueueId) return null;
+    const item = state.queue.find((x) => x.id === state.loadedQueueId);
+    return item?.payload?.fence_id || null;
+  }
+
+  function refreshQueueBadge() {
+    // Show/hide "Queue" button and maybe annotate count
+    const n = state.queue.length;
+    dom.btnQueue.hidden = false;
+    dom.btnQueue.textContent = n ? `Queue (${n})` : "Queue";
+  }
+
+  // ====== K) UI Wiring ======
   function bindUI() {
     dom.btnDraw.addEventListener("click", () => {
       if (state.mode === "drawing") finishCustomDraw();
@@ -615,11 +854,16 @@
       if (state.mode === "editing") exitCustomEditMode(true);
       if (state.mode === "drawing") cancelCustomDraw();
       clearPolygon();
+      state.loadedQueueId = null;
+      if (dom.queueSaveBar) dom.queueSaveBar.classList.add("is-hidden");
     });
 
-    dom.btnRecenter.addEventListener("click", recenter);
+    dom.btnRecenter.addEventListener("click", updateGPS);
     dom.btnSend.addEventListener("click", sendGeofence);
-    dom.btnRetryQueue.addEventListener("click", retryQueue);
+
+    // Repurpose as Queue open button
+    dom.btnQueue.hidden = false;
+    dom.btnQueue.addEventListener("click", openQueuePanel);
 
     dom.fenceName.addEventListener("input", (e) => {
       state.fenceName = e.target.value || "";
@@ -632,18 +876,25 @@
     });
   }
 
-  function cancelCustomDraw() {
-    // Leave draw mode without finalizing
-    state.leafletMap.off("click", onMapClickAddVertex);
-    state.leafletMap.off("dblclick", finishCustomDraw);
-    state.leafletMap.doubleClickZoom.enable();
-    if (state.drawTempPolygon) { state.drawTempPolygon.remove(); state.drawTempPolygon = null; }
-    state.drawRing = [];
-    cleanupEditLayer();
-    state.mode = "idle";
-    renderButtons();
-    renderStats();
-    renderJsonPreview();
+  function injectAutoGpsToggle() {
+    const toolbar = document.querySelector(".toolbar");
+    if (!toolbar) return;
+    const wrap = document.createElement("label");
+    wrap.style.display = "inline-flex";
+    wrap.style.alignItems = "center";
+    wrap.style.gap = "6px";
+    wrap.style.marginLeft = "6px";
+    wrap.innerHTML = `
+      <input id="toggleAutoGPS" type="checkbox" style="width:18px;height:18px;">
+      <span style="font-size:13px;color:var(--muted);">Auto&nbsp;GPS</span>
+    `;
+    toolbar.appendChild(wrap);
+
+    const chk = wrap.querySelector("#toggleAutoGPS");
+    chk.addEventListener("change", (e) => {
+      if (e.target.checked) startAutoGPS();
+      else stopAutoGPS();
+    });
   }
 
   function clearPolygon() {
@@ -663,12 +914,9 @@
   function renderButtons() {
     const hasPoly = !!state.drawnLayer;
 
-    // Draw button toggles between Draw/Finish in draw mode
     dom.btnDraw.textContent = (state.mode === "drawing") ? "Finish" : "Draw";
-
     dom.btnEdit.disabled  = !hasPoly || state.mode === "drawing";
     dom.btnClear.disabled = !hasPoly && state.mode !== "drawing";
-
     dom.btnEdit.textContent = (state.mode === "editing") ? "Done" : "Edit";
     dom.btnSend.disabled = !state.geojson || state.mode === "sending";
   }
@@ -700,14 +948,13 @@
 
   function liveUpdateStatsFromRing(ringLL) {
     if (!ringLL || ringLL.length < 3) {
-      renderStats(); // clears
-      // Live JSON preview even in draw mode (preview-only; not saved to state.geojson)
-      const msg = "// Add at least 3 vertices to preview payload…";
-      dom.jsonPreview.value = msg;
+      renderStats();
+      dom.jsonPreview.value = "// Add at least 3 vertices to preview payload…";
       return;
     }
     renderStats(ringLL);
-    const preview = buildPayloadFromLL(ringLL, state.fenceName);
+    const baseId = getLoadedQueueFenceId();
+    const preview = buildPayloadFromLL(ringLL, state.fenceName, baseId);
     dom.jsonPreview.value = JSON.stringify(preview, null, 2);
   }
 
@@ -723,14 +970,13 @@
   function onOnline() {
     state.online = true;
     toast("Back online.", "success");
-    if (state.queue.length) dom.btnRetryQueue.hidden = false;
   }
   function onOffline() {
     state.online = false;
     toast("Offline. Sends will be queued.", "error");
   }
 
-  // ====== K) Utils ======
+  // ====== L) Utils ======
   function uuidv4() {
     const b = new Uint8Array(16);
     crypto.getRandomValues(b);
@@ -748,5 +994,10 @@
     if (!isFinite(m2) || m2 <= 0) return "—";
     if (m2 < 1e6) return `${m2.toFixed(0)} m²`;
     return `${(m2 / 1e6).toFixed(2)} km²`;
+  }
+  function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
   }
 })();
