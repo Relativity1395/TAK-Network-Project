@@ -1,9 +1,9 @@
-// app.js — Geofence UI (MVP)
-// Uses Leaflet + Leaflet.draw (loaded via CDN in index.html)
+// app.js — Geofence UI (MVP + Custom Edit Mode)
+// Leaflet + Leaflet.draw for drawing; custom handles for editing.
 
 (() => {
   // ====== A) Config ======
-  const APP_VERSION = "0.1.0";
+  const APP_VERSION = "0.2.0";
   const API_URL = ""; // ← put your Python endpoint here, e.g. "https://example.com/geofences"
   const ENABLE_OFFLINE_QUEUE = true;
 
@@ -11,19 +11,26 @@
   const MAP_DEFAULT_ZOOM = 13;
   const MAX_VERTICES = 200;
 
+  // Handle sizes for custom edit mode
+  const VERT_SIZE = 14;   // px
+  const MID_SIZE = 10;    // px
+
   // ====== B) State & DOM cache ======
   const state = {
     leafletMap: null,
     drawnItems: null,
-    drawnLayer: null,     // the single active polygon (Leaflet layer)
-    drawHandler: null,    // L.Draw.Polygon instance while drawing
-    editHandler: null,    // L.EditToolbar.Edit instance while editing
-    mode: "idle",         // idle | drawing | editing | ready | sending | success | error
-    currentPosition: null, // {lat, lon, accuracy}
+    drawnLayer: null,          // active polygon (Leaflet layer)
+    mode: "idle",              // idle | drawing | editing | ready | sending | success | error
+    currentPosition: null,     // {lat, lon, accuracy}
     fenceName: "",
-    geojson: null,        // last-built payload object
-    queue: [],            // pending payloads when offline
+    geojson: null,             // last-built payload object
+    queue: [],                 // pending payloads when offline
     online: navigator.onLine,
+
+    // Custom edit mode runtime:
+    editLayerGroup: null,      // L.LayerGroup for handles
+    vertexMarkers: [],         // array of L.Marker for vertices
+    midMarkers: [],            // array of L.Marker for midpoints
   };
 
   const dom = {
@@ -76,13 +83,12 @@
     const map = L.map(dom.map, { zoomControl: true });
     state.leafletMap = map;
 
-    // Tile layer (OpenStreetMap via tile.openstreetmap.org)
-    const tile = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    // OSM tiles
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution:
         '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors',
       maxZoom: 19,
-    });
-    tile.addTo(map);
+    }).addTo(map);
 
     map.setView(MAP_DEFAULT_CENTER, MAP_DEFAULT_ZOOM);
 
@@ -91,28 +97,26 @@
     state.drawnItems = drawnItems;
     map.addLayer(drawnItems);
 
-    // Listen for draw/edit/delete events
+    // Listen for draw/create/delete from Leaflet.draw
     map.on(L.Draw.Event.CREATED, (e) => {
-      // Only allow a single polygon at a time
+      // If a polygon exists, clear it and any edit handles
       if (state.drawnLayer) {
+        cleanupEditMode();
         state.drawnItems.removeLayer(state.drawnLayer);
         state.drawnLayer = null;
+        state.geojson = null;
       }
+
+      // Add the new polygon
       const layer = e.layer;
       state.drawnItems.addLayer(layer);
       state.drawnLayer = layer;
+
+      // Update UI / payload
       state.mode = "ready";
       buildAndRenderPayload();
       renderButtons();
       renderSheet(true);
-    });
-
-    map.on(L.Draw.Event.EDITED, () => {
-      // user saved edits
-      if (!state.drawnLayer) return;
-      buildAndRenderPayload();
-      state.mode = "ready";
-      renderButtons();
     });
 
     map.on(L.Draw.Event.DELETED, () => {
@@ -122,12 +126,11 @@
 
   function startDrawing() {
     if (!state.leafletMap) return;
-    // Disable edit mode if active
-    stopEditing(true);
+    // Leaving edit mode if active
+    if (state.mode === "editing") exitCustomEditMode(true);
 
-    // Configure polygon drawing
-    if (state.drawHandler) state.drawHandler.disable();
-    state.drawHandler = new L.Draw.Polygon(state.leafletMap, {
+    // Create and enable a polygon draw tool
+    const draw = new L.Draw.Polygon(state.leafletMap, {
       showArea: false,
       allowIntersection: false,
       shapeOptions: {
@@ -139,41 +142,14 @@
       metric: true,
       feet: false,
     });
-    state.drawHandler.enable();
+    draw.enable();
     state.mode = "drawing";
     toast("Tap to add vertices. Double-tap to finish.", "success");
     renderButtons();
   }
 
-  function startEditing() {
-    if (!state.leafletMap || !state.drawnItems || !state.drawnLayer) return;
-    // Programmatically enable edit mode for existing polygon
-    if (state.editHandler) state.editHandler.disable();
-    state.editHandler = new L.EditToolbar.Edit(state.leafletMap, {
-      featureGroup: state.drawnItems,
-      selectedPathOptions: L.EditToolbar.Edit.prototype.options.selectedPathOptions,
-    });
-    state.editHandler.enable();
-    state.mode = "editing";
-    renderButtons();
-    toast("Drag vertices to adjust. Click Edit again to save.", "success");
-  }
-
-  function stopEditing(save = true) {
-    if (!state.editHandler) return;
-    try {
-      if (save) state.editHandler.save();
-      state.editHandler.disable();
-    } catch (_) {
-      // ignore
-    }
-    state.editHandler = null;
-    state.mode = "ready";
-    buildAndRenderPayload();
-    renderButtons();
-  }
-
   function clearPolygon() {
+    cleanupEditMode();
     if (state.drawnLayer) {
       state.drawnItems.removeLayer(state.drawnLayer);
       state.drawnLayer = null;
@@ -197,7 +173,6 @@
         const { latitude, longitude, accuracy } = pos.coords;
         state.currentPosition = { lat: latitude, lon: longitude, accuracy };
         state.leafletMap.setView([latitude, longitude], 16);
-        // draw an accuracy circle (light)
         L.circle([latitude, longitude], {
           radius: Math.min(accuracy || 0, 60),
           weight: 1,
@@ -206,7 +181,6 @@
         }).addTo(state.leafletMap);
       },
       (err) => {
-        // Most common cause: not HTTPS or permission denied
         console.warn("Geolocation error:", err);
         toast("Couldn’t get location; using default view.", "error");
       },
@@ -222,14 +196,194 @@
     }
   }
 
-  // ====== F) Geometry, Validation, Stats ======
-  function getPolygonLatLngs(layer) {
-    // Leaflet polygon latlngs structure: [ [LatLng, LatLng, ...] ] for simple polygons
+  // ====== F) Custom Edit Mode ======
+  function enterCustomEditMode() {
+    if (!state.drawnLayer) return;
+    if (state.mode === "editing") return;
+
+    // Prepare edit layer group
+    cleanupEditMode();
+    state.editLayerGroup = L.layerGroup().addTo(state.leafletMap);
+    state.vertexMarkers = [];
+    state.midMarkers = [];
+
+    // Create handles
+    const ring = getRingLatLngs(state.drawnLayer); // open ring (no repeated last)
+    ring.forEach((latlng, i) => addVertexMarker(latlng, i));
+    addAllMidMarkers();
+
+    state.mode = "editing";
+    renderButtons();
+    toast("Drag white squares to move vertices. Tap a white square to remove. Tap a small dot on an edge to insert a vertex.", "success", 4200);
+  }
+
+  function exitCustomEditMode(save = true) {
+    if (save && state.drawnLayer) {
+      // Rebuild payload from current geometry
+      buildAndRenderPayload();
+      state.mode = "ready";
+    } else {
+      state.mode = state.drawnLayer ? "ready" : "idle";
+    }
+    cleanupEditMode();
+    renderButtons();
+  }
+
+  function cleanupEditMode() {
+    // Remove all edit handles
+    if (state.editLayerGroup) {
+      state.editLayerGroup.remove();
+      state.editLayerGroup = null;
+    }
+    state.vertexMarkers = [];
+    state.midMarkers = [];
+  }
+
+  // --- Vertex + Midpoint handles ---
+  function addVertexMarker(latlng, index) {
+    const marker = L.marker(latlng, {
+      draggable: true,
+      icon: L.divIcon({
+        className: "",
+        iconSize: [VERT_SIZE, VERT_SIZE],
+        html: `<div style="
+          width:${VERT_SIZE}px;height:${VERT_SIZE}px;
+          background:#fff;border:2px solid #60a5fa;border-radius:4px;
+          box-shadow:0 1px 3px rgba(0,0,0,.25);
+        "></div>`,
+      }),
+      zIndexOffset: 1000,
+    });
+
+    let dragged = false;
+
+    marker.on("dragstart", () => {
+      dragged = false;
+    });
+
+    marker.on("drag", (e) => {
+      dragged = true;
+      const newLatLng = e.target.getLatLng();
+      const ring = getRingLatLngs(state.drawnLayer);
+      ring[index] = newLatLng;
+      setRingLatLngs(state.drawnLayer, ring);
+      // Move this marker, and refresh only adjacent midpoints
+      state.vertexMarkers[index].setLatLng(newLatLng);
+      refreshAdjacentMidMarkers(index);
+      liveUpdateStats();
+    });
+
+    marker.on("dragend", () => {
+      // After drag, rebuild payload
+      buildAndRenderPayload();
+    });
+
+    marker.on("click", () => {
+      // Click (not a drag) removes the vertex, if safe
+      if (dragged) return; // ignore clicks following a drag
+      const ring = getRingLatLngs(state.drawnLayer);
+      if (ring.length <= 3) {
+        toast("Need at least 3 vertices.", "error");
+        return;
+      }
+      // Remove this vertex
+      ring.splice(index, 1);
+      setRingLatLngs(state.drawnLayer, ring);
+      // Rebuild all handles with new indexing
+      rebuildAllHandles();
+      buildAndRenderPayload();
+    });
+
+    marker.addTo(state.editLayerGroup);
+    state.vertexMarkers[index] = marker;
+  }
+
+  function addMidMarkerBetween(i, j) {
+    // i and j are consecutive vertex indices (wrap allowed)
+    const ring = getRingLatLngs(state.drawnLayer);
+    const a = ring[i], b = ring[j];
+    const mid = L.latLng((a.lat + b.lat) / 2, (a.lng + b.lng) / 2);
+    const m = L.marker(mid, {
+      draggable: false,
+      icon: L.divIcon({
+        className: "",
+        iconSize: [MID_SIZE, MID_SIZE],
+        html: `<div style="
+          width:${MID_SIZE}px;height:${MID_SIZE}px;
+          background:#fff;border:2px solid #9ca3af;border-radius:999px;
+          box-shadow:0 1px 2px rgba(0,0,0,.2);
+        " title="Add vertex"></div>`,
+      }),
+      zIndexOffset: 900,
+    });
+
+    // Insert new vertex on click
+    m.on("click", () => {
+      const ring2 = getRingLatLngs(state.drawnLayer);
+      // insert at j (between i and j)
+      ring2.splice(j, 0, m.getLatLng());
+      setRingLatLngs(state.drawnLayer, ring2);
+      rebuildAllHandles();
+      buildAndRenderPayload();
+    });
+
+    m.addTo(state.editLayerGroup);
+    state.midMarkers.push({ marker: m, i, j });
+  }
+
+  function addAllMidMarkers() {
+    const ring = getRingLatLngs(state.drawnLayer);
+    for (let i = 0; i < ring.length; i++) {
+      const j = (i + 1) % ring.length;
+      addMidMarkerBetween(i, j);
+    }
+  }
+
+  function refreshAdjacentMidMarkers(index) {
+    // Remove and re-add mid markers adjacent to vertex index (index-1,index) and (index,index+1)
+    if (!state.editLayerGroup) return;
+    // Clear all mids and rebuild (cheap and simple for hackathon)
+    state.midMarkers.forEach(({ marker }) => marker.remove());
+    state.midMarkers = [];
+    addAllMidMarkers();
+  }
+
+  function rebuildAllHandles() {
+    // Remove all handles then recreate with correct indices
+    if (!state.editLayerGroup) return;
+    state.vertexMarkers.forEach((m) => m.remove());
+    state.midMarkers.forEach(({ marker }) => marker.remove());
+    state.vertexMarkers = [];
+    state.midMarkers = [];
+
+    const ring = getRingLatLngs(state.drawnLayer);
+    ring.forEach((latlng, i) => addVertexMarker(latlng, i));
+    addAllMidMarkers();
+    liveUpdateStats();
+  }
+
+  function liveUpdateStats() {
+    const ring = getRingLatLngs(state.drawnLayer);
+    renderStats(ring);
+    // Preview payload but keep same fence_id until send
+    const previewPayload = buildPayload(ring, state.fenceName);
+    dom.jsonPreview.value = JSON.stringify(previewPayload, null, 2);
+  }
+
+  // ====== G) Geometry, Validation, Stats ======
+  function getRingLatLngs(layer) {
+    // Returns OPEN ring (no duplicated last)
     if (!layer) return [];
     const rings = layer.getLatLngs();
-    if (!rings || !rings.length) return [];
     const firstRing = Array.isArray(rings[0]) ? rings[0] : rings;
-    return firstRing.map((p) => ({ lat: p.lat, lon: p.lng }));
+    // Leaflet stores LatLng with {lat, lng}
+    return firstRing.map((p) => L.latLng(p.lat, p.lng));
+  }
+
+  function setRingLatLngs(layer, ring) {
+    // Set an OPEN ring; Leaflet draws it closed
+    layer.setLatLngs([ring]);
+    layer.redraw();
   }
 
   function validateCoords(coords) {
@@ -237,27 +391,22 @@
     if (coords.length > MAX_VERTICES) {
       return { ok: false, reason: `Too many vertices (>${MAX_VERTICES}).` };
     }
-    // Basic uniqueness check (avoid duplicates causing zero-length edges)
-    const uniq = new Set(coords.map((c) => `${c.lat.toFixed(6)},${c.lon.toFixed(6)}`));
+    const uniq = new Set(coords.map((c) => `${c.lat.toFixed(6)},${c.lng.toFixed(6)}`));
     if (uniq.size < 3) return { ok: false, reason: "Vertices too close/duplicate." };
-    // Self-intersection check is omitted in MVP (add Turf later)
     return { ok: true };
   }
 
   function toClosedRingLonLat(coords) {
-    // GeoJSON order: [lon, lat]
-    const ring = coords.map((c) => [round6(c.lon), round6(c.lat)]);
+    // Accepts array of L.LatLng; returns [[lon,lat], ... closed]
+    const ring = coords.map((c) => [round6(c.lng), round6(c.lat)]);
     const first = ring[0];
     const last = ring[ring.length - 1];
     if (first[0] !== last[0] || first[1] !== last[1]) ring.push(first);
     return ring;
   }
 
-  function round6(n) {
-    return Math.round(n * 1e6) / 1e6; // ~0.11m at equator
-  }
+  function round6(n) { return Math.round(n * 1e6) / 1e6; }
 
-  // Stats: perimeter (Haversine), area (planar approx via Web Mercator + shoelace)
   function computeStats(coords) {
     if (!coords || coords.length < 3) {
       return { vertices: 0, perimeter_m: 0, area_m2: 0 };
@@ -265,7 +414,7 @@
     const ring = toClosedRingLonLat(coords);
     let perimeter = 0;
     for (let i = 1; i < ring.length; i++) {
-      perimeter += haversineMeters(ring[i - 1][1], ring[i - 1][0], ring[i][1], ring[i][0]); // lat,lon inputs
+      perimeter += haversineMeters(ring[i - 1][1], ring[i - 1][0], ring[i][1], ring[i][0]); // lat,lon
     }
     const area = polygonAreaWebMercator(ring);
     return { vertices: ring.length - 1, perimeter_m: perimeter, area_m2: Math.abs(area) };
@@ -276,14 +425,11 @@
     const toRad = (d) => (d * Math.PI) / 180;
     const dLat = toRad(lat2 - lat1);
     const dLon = toRad(lon2 - lon1);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
     return 2 * R * Math.asin(Math.sqrt(a));
   }
 
   function lonLatToWebMercator(lon, lat) {
-    // EPSG:3857
     const R = 6378137.0;
     const x = (lon * Math.PI) / 180 * R;
     const y = Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) * R;
@@ -291,18 +437,16 @@
   }
 
   function polygonAreaWebMercator(ringLonLat) {
-    // ringLonLat: [[lon,lat], ... closed]
     const pts = ringLonLat.map(([lon, lat]) => lonLatToWebMercator(lon, lat));
     let sum = 0;
     for (let i = 0; i < pts.length - 1; i++) {
-      const [x1, y1] = pts[i];
-      const [x2, y2] = pts[i + 1];
+      const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
       sum += x1 * y2 - x2 * y1;
     }
     return Math.abs(sum) / 2; // m^2
   }
 
-  // ====== G) Payload ======
+  // ====== H) Payload ======
   function buildPayload(coords, name) {
     const ring = toClosedRingLonLat(coords);
     return {
@@ -310,20 +454,20 @@
       fence_id: `ui-${uuidv4()}`,
       created_at: new Date().toISOString(),
       crs: "EPSG:4326",
-      shape: {
-        type: "Polygon",
-        coordinates: [ring],
-      },
-      properties: {
-        name: name || "",
-        notes: "Drawn on tablet",
-      },
+      shape: { type: "Polygon", coordinates: [ring] },
+      properties: { name: name || "", notes: "Drawn on tablet" },
     };
   }
 
   function buildAndRenderPayload() {
-    if (!state.drawnLayer) return;
-    const coords = getPolygonLatLngs(state.drawnLayer);
+    if (!state.drawnLayer) {
+      state.geojson = null;
+      dom.btnSend.disabled = true;
+      renderStats();
+      renderJsonPreview();
+      return;
+    }
+    const coords = getRingLatLngs(state.drawnLayer);
     const val = validateCoords(coords);
     if (!val.ok) {
       state.geojson = null;
@@ -339,7 +483,7 @@
     renderJsonPreview();
   }
 
-  // ====== H) Networking & Queue ======
+  // ====== I) Networking & Queue ======
   async function sendGeofence() {
     if (!state.geojson) return;
     if (!API_URL) {
@@ -353,10 +497,7 @@
     try {
       const res = await fetch(API_URL, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          // "Authorization": "Bearer <API_KEY>", // optional
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(state.geojson),
       });
       if (!res.ok) {
@@ -434,9 +575,7 @@
   }
 
   function saveQueue() {
-    try {
-      localStorage.setItem("geofenceQueue", JSON.stringify(state.queue));
-    } catch (_) {}
+    try { localStorage.setItem("geofenceQueue", JSON.stringify(state.queue)); } catch (_) {}
   }
   function loadQueue() {
     try {
@@ -448,25 +587,18 @@
     }
   }
 
-  // ====== I) UI Wiring ======
+  // ====== J) UI Wiring ======
   function bindUI() {
-    dom.btnDraw.addEventListener("click", () => {
-      if (state.mode === "editing") {
-        stopEditing(true);
-      }
-      startDrawing();
-    });
+    dom.btnDraw.addEventListener("click", () => startDrawing());
 
     dom.btnEdit.addEventListener("click", () => {
-      if (state.mode === "editing") {
-        stopEditing(true); // save & leave edit mode
-      } else if (state.drawnLayer) {
-        startEditing();
-      }
+      if (!state.drawnLayer) return;
+      if (state.mode === "editing") exitCustomEditMode(true);
+      else enterCustomEditMode();
     });
 
     dom.btnClear.addEventListener("click", () => {
-      if (state.mode === "editing") stopEditing(false);
+      if (state.mode === "editing") exitCustomEditMode(true);
       clearPolygon();
     });
 
@@ -481,7 +613,6 @@
       if (state.drawnLayer) buildAndRenderPayload();
     });
 
-    // Expand/collapse bottom sheet when handle area is tapped (simple UX)
     dom.infoSheet.querySelector(".sheet__handle").addEventListener("click", () => {
       dom.infoSheet.classList.toggle("open");
     });
@@ -492,11 +623,8 @@
     dom.btnEdit.disabled = !hasPoly;
     dom.btnClear.disabled = !hasPoly;
 
-    if (state.mode === "editing") {
-      dom.btnEdit.textContent = "Done";
-    } else {
-      dom.btnEdit.textContent = "Edit";
-    }
+    if (state.mode === "editing") dom.btnEdit.textContent = "Done";
+    else dom.btnEdit.textContent = "Edit";
 
     dom.btnSend.disabled = !state.geojson || state.mode === "sending";
   }
@@ -517,7 +645,7 @@
   }
 
   function renderStats(coords) {
-    if (!coords && state.drawnLayer) coords = getPolygonLatLngs(state.drawnLayer);
+    if (!coords && state.drawnLayer) coords = getRingLatLngs(state.drawnLayer);
     if (!coords || coords.length < 3) {
       dom.statVertices.textContent = "0";
       dom.statPerimeter.textContent = "—";
@@ -538,9 +666,7 @@
     const el = dom.statusToast;
     el.textContent = msg;
     el.className = `toast show ${type === "error" ? "error" : "success"}`;
-    setTimeout(() => {
-      el.classList.remove("show");
-    }, ms);
+    setTimeout(() => el.classList.remove("show"), ms);
   }
 
   function onOnline() {
@@ -553,9 +679,8 @@
     toast("Offline. Sends will be queued.", "error");
   }
 
-  // ====== J) Utils ======
+  // ====== K) Utils ======
   function uuidv4() {
-    // RFC4122 v4
     const buf = new Uint8Array(16);
     crypto.getRandomValues(buf);
     buf[6] = (buf[6] & 0x0f) | 0x40;
